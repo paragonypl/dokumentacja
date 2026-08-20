@@ -1,0 +1,1118 @@
+openapi: 3.1.0
+info:
+  title: API Paragony.pl
+  version: "1.0"
+  license:
+    name: Wszelkie prawa zastrzeżone (proprietary)
+    url: https://paragony.pl
+  description: |
+    API do fiskalizacji paragonów i wystawiania e-paragonów na drukarkach fiskalnych
+    podłączonych do Paragony.pl — dla zewnętrznych integratorów.
+
+    Dokumentacja opisowa: katalog `docs/` tego repozytorium.
+
+    **Hosty:** rejestracja konta idzie na `https://app.paragony.pl`; całe pozostałe API
+    na subdomenę konta `https://{prefix}.paragony.pl`. Żądania na `paragony.pl` (bez
+    subdomeny) zwrócą stronę HTML, nie API.
+
+    **Uwierzytelnienie:** JWT HS256 generowany z tokena API, w standardowym nagłówku
+    `Authorization: Bearer <jwt>` — szczegóły w opisie schematu zabezpieczeń
+    i w `docs/02-konto-i-uwierzytelnianie.md`.
+
+servers:
+  - url: "https://{prefix}.paragony.pl"
+    description: Subdomena konta — wszystkie operacje poza rejestracją konta.
+    variables:
+      prefix:
+        default: moja-firma
+        description: Prefix (subdomena) konta wybrany przy rejestracji.
+
+security:
+  - jwtAuth: []
+
+tags:
+  - name: konto
+    description: Rejestracja konta i tokeny API
+  - name: zlecenia
+    description: Zlecenia fiskalizacji (print requests)
+  - name: drukarki
+    description: Drukarki fiskalne konta
+  - name: webhooki
+    description: Konfiguracja connectora webhooków
+
+paths:
+  /account/accounts.json:
+    post:
+      operationId: createAccount
+      tags: [konto]
+      summary: Rejestracja konta
+      description: |
+        **Wyłącznie na hoście `https://app.paragony.pl`.** Tworzy konto z subdomeną
+        `{prefix}.paragony.pl` i użytkownikiem. Odpowiedź zawiera `user.api_token` —
+        **jedyny moment, w którym surowy token jest zwracany**.
+      security: []
+      servers:
+        - url: https://app.paragony.pl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account, user]
+              properties:
+                account:
+                  type: object
+                  required: [prefix]
+                  properties:
+                    prefix:
+                      type: string
+                      description: Subdomena konta (unikalna).
+                      examples: [moja-firma]
+                user:
+                  type: object
+                  required: [email, password, password_confirmation]
+                  properties:
+                    email: { type: string, format: email }
+                    password: { type: string }
+                    password_confirmation: { type: string }
+      responses:
+        "201":
+          description: Konto utworzone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  prefix: { type: string }
+                  product_app:
+                    type: string
+                    description: Dla kont Paragony.pl — `fiskator`.
+                  user:
+                    type: object
+                    properties:
+                      login: { type: string }
+                      email: { type: string }
+                      api_token:
+                        type: string
+                        description: Surowy token API — zapisz, nie będzie pokazany ponownie.
+                additionalProperties: true
+        "422":
+          description: |
+            Błąd walidacji. Błędy użytkownika wracają pod kluczem `user`, błędy konta
+            w top-levelowej mapie `pole → lista komunikatów`.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+              example:
+                user:
+                  login: ["zostało już zajęte"]
+
+  /account/api_tokens.json:
+    get:
+      operationId: listApiTokens
+      tags: [konto]
+      summary: Lista tokenów API (metadane, bez wartości)
+      description: |
+        Zwraca tablicę metadanych tokenów — pole `token` (surowa wartość) nigdy się tu nie
+        pojawia. Domyślnie tokeny bieżącego użytkownika; `?for_account=yes` — tokeny kontowe.
+        Paginacja jak w pozostałych listach (`docs/04-endpointy.md#paginacja`).
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - name: for_account
+          in: query
+          required: false
+          schema: { type: string, enum: ["yes"] }
+          description: "`yes` — zwróć tokeny kontowe zamiast tokenów bieżącego użytkownika."
+      responses:
+        "200":
+          description: Tablica tokenów (metadane).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApiToken" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createApiToken
+      tags: [konto]
+      summary: Utworzenie tokena API
+      description: |
+        Odpowiedź `201` zawiera pole `token` — **jedyny moment, w którym surowy token
+        jest zwracany**. Uwierzytelnienie: JWT podpisany dowolnym już posiadanym tokenem
+        (np. tym z rejestracji konta).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_token]
+              properties:
+                api_token:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                      description: Nazwa tokena (żeby wiedzieć, co go używa).
+                    for_account:
+                      type: boolean
+                      description: >
+                        `true` (zalecane dla integracji) — token kontowy, niezależny od
+                        losów pojedynczego użytkownika.
+      responses:
+        "201":
+          description: Token utworzony.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiToken"
+                  - type: object
+                    properties:
+                      token:
+                        type: string
+                        description: Surowy token API — zwracany tylko tutaj.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /print_requests.json:
+    post:
+      operationId: createPrintRequests
+      tags: [zlecenia]
+      summary: Utworzenie zleceń fiskalizacji
+      description: |
+        Dokumenty wysyłasz w tablicy `print_requests[]`; `vendor`/`ptu_letter_in_names`
+        to pola wspólne dla całego żądania. Każdy dokument walidowany **niezależnie**.
+        Odpowiedź to kontrakt pozycyjny: `print_requests[i]` odpowiedzi odpowiada
+        `print_requests[i]` żądania — dokument przyjęty to pełny obiekt zlecenia (ma `id`),
+        odrzucony to `{external_id, errors}`. `200` = przynajmniej jeden przyjęty,
+        `422` = żaden.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PrintRequestCreate"
+      responses:
+        "200":
+          description: Przynajmniej jeden dokument przyjęty (możliwe częściowe błędy).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrintRequestCreateResult" }
+        "422":
+          description: Żaden dokument nie został przyjęty.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrintRequestCreateResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+    get:
+      operationId: listPrintRequests
+      tags: [zlecenia]
+      summary: Lista zleceń
+      description: >
+        Goła tablica JSON, 25 elementów/stronę — zachowanie paginacji opisuje parametr
+        `page`. Parametry filtrowania można łączyć.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/PrintRequestStatus" }
+          description: Dokładne dopasowanie statusu.
+          examples: { przyklad: { value: er_printed } }
+        - name: mode
+          in: query
+          schema: { type: string, enum: [print, e_receipt] }
+          description: Tylko zlecenia danego trybu.
+          examples: { przyklad: { value: e_receipt } }
+        - name: email_status
+          in: query
+          schema: { type: string, enum: [queued, sent, failed] }
+          description: >
+            Dokładne dopasowanie stanu wysyłki e-paragonu mailem
+            (`EmailDelivery.email_status`).
+          examples: { przyklad: { value: failed } }
+        - name: system_number
+          in: query
+          schema: { type: string }
+          description: Dokładne dopasowanie numeru dokumentu (`source_document.system_number`).
+          examples: { przyklad: { value: "PAR/10045/2026" } }
+        - name: order_number
+          in: query
+          schema: { type: string }
+          description: Dokładne dopasowanie numeru zamówienia (`source_document.order_number`).
+          examples: { przyklad: { value: "10045" } }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Dopasowanie częściowe (ILIKE) po `system_number` lub `order_number`.
+          examples: { przyklad: { value: "10045" } }
+        - name: created_at_from
+          in: query
+          schema: { type: string, format: date }
+          description: Data utworzenia zlecenia — dolna granica zakresu.
+          examples: { przyklad: { value: "2026-07-01" } }
+        - name: created_at_to
+          in: query
+          schema: { type: string, format: date }
+          description: Data utworzenia zlecenia — górna granica zakresu.
+          examples: { przyklad: { value: "2026-07-31" } }
+        - name: print_time_from
+          in: query
+          schema: { type: string, format: date }
+          description: >
+            Moment pobrania zlecenia przez drukarkę (przejście w `printing`) — dolna
+            granica zakresu.
+          examples: { przyklad: { value: "2026-07-01" } }
+        - name: print_time_to
+          in: query
+          schema: { type: string, format: date }
+          description: Moment pobrania zlecenia przez drukarkę — górna granica zakresu.
+          examples: { przyklad: { value: "2026-07-31" } }
+      responses:
+        "200":
+          description: Tablica zleceń.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PrintRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /print_requests/{id}.json:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+        description: Identyfikator zlecenia (z odpowiedzi tworzenia lub webhooka).
+    get:
+      operationId: showPrintRequest
+      tags: [zlecenia]
+      summary: Status/szczegóły zlecenia
+      responses:
+        "200":
+          description: Zlecenie.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrintRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      operationId: cancelPrintRequest
+      tags: [zlecenia]
+      summary: Anulowanie zlecenia
+      description: |
+        Zlecenie oczekujące (`to_print`/`printing`) → anulowane (`status=cancelled`).
+        Zafiskalizowane → `422` (anulowanie niemożliwe). Już `cancelled`/`error` →
+        `200` bez zmian (idempotentne). „Edycja” zlecenia = anuluj + utwórz nowe.
+      responses:
+        "200":
+          description: Zlecenie po operacji (przy anulowaniu `status=cancelled`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrintRequest" }
+        "422":
+          description: Zlecenia zafiskalizowanego nie można anulować.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleMessage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /print_requests/{id}/send_by_email.json:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+        description: Identyfikator zlecenia.
+    post:
+      operationId: sendPrintRequestByEmail
+      tags: [zlecenia]
+      summary: Wysyłka e-paragonu mailem
+      description: |
+        Działa wyłącznie dla zleceń w statusie `er_printed`
+        (`docs/03-domena.md#statusy-zlecenia`). Wysyłka jest asynchroniczna — każde
+        wywołanie zleca jeden mail; ponowienie (np. po `email_status=failed`) jest
+        bezpieczne. Nieudaną wysyłkę sygnalizuje webhook `print_request:email`;
+        stan `queued`/`sent` czytaj przez `GET /print_requests/{id}.json`
+        (`email_delivery`).
+
+        **Limit: 5 wysyłek na zlecenie**, licząc wysyłkę automatyczną. Liczone są
+        próby, nie udane doręczenia, a limit nie odnawia się — po wyczerpaniu
+        żądanie wraca z `422` (`docs/04-endpointy.md#wysylka-mailem`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                buyer_email:
+                  type: string
+                  format: email
+                  description: >
+                    Ustawia adres nabywcy zlecenia na stałe (korekta albo adres zebrany po
+                    fiskalizacji). Bez pola: wysyłka na dotychczasowy `buyer.email`.
+                  examples: ["poprawiony@example.com"]
+      responses:
+        "200":
+          description: Wysyłka zakolejkowana.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: >
+            Wysyłka niemożliwa w bieżącym stanie zlecenia, błędny/brakujący adres
+            e-mail, albo wyczerpany limit wysyłek dla tego zlecenia
+            (`docs/06-bledy.md`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+        "429":
+          description: Zbyt wiele prób wysyłki — anty-spam limit, ponów później.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusMessage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /printers.json:
+    get:
+      operationId: listPrinters
+      tags: [drukarki]
+      summary: Lista drukarek konta
+      description: >
+        Goła tablica JSON, 25 elementów/stronę (zachowanie paginacji — parametr `page`).
+        Z listy bierzesz `id` drukarki do `print_requests[].printer_id`.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - name: uid
+          in: query
+          schema: { type: string }
+          description: Dokładne dopasowanie identyfikatora sprzętowego.
+          examples: { przyklad: { value: "TEST-PRINTER-1" } }
+        - name: name
+          in: query
+          schema: { type: string }
+          description: Dokładne dopasowanie nazwy drukarki.
+          examples: { przyklad: { value: "Kasa 1" } }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Dopasowanie częściowe (ILIKE) po `uid` lub `name`.
+          examples: { przyklad: { value: kasa } }
+      responses:
+        "200":
+          description: Tablica drukarek.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Printer" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /printers/{id}.json:
+    patch:
+      operationId: updatePrinter
+      tags: [drukarki]
+      summary: Aktualizacja drukarki
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+          description: Identyfikator drukarki z listy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [printer]
+              properties:
+                printer:
+                  $ref: "#/components/schemas/PrinterInput"
+      responses:
+        "200":
+          description: Zaktualizowana drukarka.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Printer" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Błąd walidacji — mapa pole → lista komunikatów.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /connect/connectors.json:
+    post:
+      operationId: createConnector
+      tags: [webhooki]
+      summary: Utworzenie connectora webhooków
+      description: |
+        Connector `kind=paragony/callback` z `code=paragony-<vendor>` rejestruje adres,
+        na który Paragony.pl wysyła webhooki. **`secret_token` jest tylko do zapisu** —
+        żadna odpowiedź go nie zwraca; zapisz go u siebie w momencie ustawiania.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connector]
+              properties:
+                connector:
+                  $ref: "#/components/schemas/ConnectorInput"
+      responses:
+        "201":
+          description: Connector utworzony (bez `secret_token`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connector" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /connect/connectors/{code}.json:
+    parameters:
+      - name: code
+        in: path
+        required: true
+        schema: { type: string }
+        description: Code connectora (`paragony-<vendor>`, np. `paragony-mojsklep`).
+    get:
+      operationId: showConnector
+      tags: [webhooki]
+      summary: Podgląd connectora
+      responses:
+        "200":
+          description: Connector (bez `secret_token`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connector" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      operationId: updateConnector
+      tags: [webhooki]
+      summary: Zmiana URL / rotacja sekretu
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connector]
+              properties:
+                connector:
+                  type: object
+                  properties:
+                    url: { type: string, format: uri }
+                    secret_token: { type: string }
+      responses:
+        "200":
+          description: Connector zaktualizowany (bez `secret_token`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connector" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      operationId: deleteConnector
+      tags: [webhooki]
+      summary: Usunięcie connectora
+      responses:
+        "204":
+          description: Usunięto.
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+webhooks:
+  print_request_update:
+    post:
+      operationId: webhookPrintRequestUpdate
+      summary: "Webhook: zmiana statusu zlecenia (`kind=print_request:update`)"
+      description: |
+        POST na `url` connectora przy każdej zmianie statusu zlecenia. Podpis: JWT HS256
+        (sekret = `secret_token` connectora) w `Authorization: Bearer <jwt>`, claimy
+        `bh` (base64url(SHA256(surowego body)), bez paddingu), `htm="POST"`, `htu` (URL
+        connectora — weryfikuj tylko informacyjnie), `iat`, `exp` (5 min).
+        **`bh` licz z dokładnie odebranych bajtów body, przed parsowaniem JSON.**
+        Dla `status=er_printed` payload zawsze zawiera `view_url` (i tylko wtedy).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, print_request]
+              properties:
+                kind:
+                  type: string
+                  const: "print_request:update"
+                print_request:
+                  type: object
+                  required: [id, external_id, status]
+                  properties:
+                    id:
+                      type: integer
+                      description: Identyfikator zlecenia w Paragony.pl.
+                    external_id:
+                      type: string
+                      description: Identyfikator dokumentu w systemie integratora.
+                    status:
+                      $ref: "#/components/schemas/PrintRequestStatus"
+                    view_url:
+                      type: string
+                      format: uri
+                      description: Publiczny link e-paragonu — tylko przy `status=er_printed`.
+      responses:
+        "200":
+          description: Potwierdzenie odbioru — dowolny kod 2xx; body ignorowane.
+
+  print_request_email:
+    post:
+      operationId: webhookPrintRequestEmail
+      summary: "Webhook: nieudana wysyłka e-paragonu mailem (`kind=print_request:email`)"
+      description: |
+        POST na `url` connectora po każdej nieudanej próbie wysyłki e-paragonu mailem
+        (`send_by_email`; podpis jak wyżej) — ponowienie, które znowu się nie udało, daje
+        kolejne zdarzenie. Dla `queued`/`sent` webhooka nie ma — te stany czytaj przez
+        `GET /print_requests/{id}.json` (`email_delivery`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, print_request]
+              properties:
+                kind:
+                  type: string
+                  const: "print_request:email"
+                print_request:
+                  type: object
+                  required: [id, external_id, email_delivery]
+                  properties:
+                    id:
+                      type: integer
+                      description: Identyfikator zlecenia w Paragony.pl.
+                    external_id:
+                      type: string
+                      description: Identyfikator dokumentu w systemie integratora.
+                    email_delivery:
+                      $ref: "#/components/schemas/EmailDelivery"
+      responses:
+        "200":
+          description: Potwierdzenie odbioru — dowolny kod 2xx; body ignorowane.
+
+  printer_event:
+    post:
+      operationId: webhookPrinterEvent
+      summary: "Webhook: zmiana drukarki (`kind=printer:create|update|destroy`)"
+      description: |
+        POST na `url` connectora przy dodaniu/zmianie/usunięciu drukarki (podpis jak wyżej).
+        Connector dostaje zdarzenia od momentu utworzenia — stan początkowy drukarek
+        pobierz `GET /printers.json`. `printer:destroy` niesie minimalny
+        obiekt `{id, uid}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, printer]
+              properties:
+                kind:
+                  type: string
+                  enum: ["printer:create", "printer:update", "printer:destroy"]
+                printer:
+                  $ref: "#/components/schemas/Printer"
+      responses:
+        "200":
+          description: Potwierdzenie odbioru — dowolny kod 2xx; body ignorowane.
+
+components:
+  securitySchemes:
+    jwtAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Standardowy nagłówek: `Authorization: Bearer <jwt>`.
+
+        `<jwt>` = JWT **HS256**, którego **sekretem HMAC jest surowy token API**, payload:
+        `{"key": "<pierwsze 16 znaków hex SHA-256 z tokena>", "exp": <unix ts>}`
+        (zalecane TTL ~300 s), base64url bez paddingu.
+        Przykłady generowania (Ruby/Node): `docs/02-konto-i-uwierzytelnianie.md`.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, default: 1 }
+      description: >
+        Numer strony (25 elementów/stronę). Strona poza zakresem zwraca ostatnią stronę
+        (nie pustą) — warunek stopu pętli: brak nowych identyfikatorów.
+        Szerzej: `docs/04-endpointy.md#paginacja`.
+
+  responses:
+    Unauthorized:
+      description: >
+        Brak nagłówka `Authorization`, nierozpoznany format albo niepoprawny JWT
+        (zły podpis/fingerprint, wygasły `exp`, uszkodzona struktura) —
+        `{"error":"login_required"}`. Odpowiedź nie niesie przyczyny; zdiagnozuj
+        po swojej stronie regułami budowy JWT.
+    NotFound:
+      description: Zasób nie istnieje (sprawdź też subdomenę konta).
+    ValidationError:
+      description: Błąd walidacji.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+
+  schemas:
+    PrintRequestStatus:
+      type: string
+      description: |
+        Cykl życia zlecenia (`docs/03-domena.md#statusy-zlecenia`). Końcowe: `printed`,
+        `er_printed`, `er_fatal`, `error`, `cancelled`. Zafiskalizowane = `printed` lub
+        `er_printed`. `er_printed` jest ostateczny i zawsze przychodzi z `view_url`.
+      enum:
+        - to_print
+        - printing
+        - printed
+        - er_pending
+        - er_fail
+        - er_printed
+        - er_fatal
+        - error
+        - cancelled
+
+    PrintRequestCreate:
+      type: object
+      required: [print_requests]
+      properties:
+        vendor:
+          type: string
+          minLength: 1
+          description: >
+            Identyfikator Twojego systemu (niepusty, STABILNY string; zalecany format
+            `[a-z0-9-]`, np. `mojsklep`) — wartość domyślna dla wszystkich dokumentów żądania;
+            dokument może go nadpisać własnym `print_requests[].vendor`. Wyznacza routing
+            webhooków (connector `paragony-<vendor>`) i przestrzeń unikalności
+            `external_id`. Dokument bez rozstrzygniętego vendora (wspólnego ani własnego)
+            zostaje odrzucony („vendor: nie może być puste” w `errors[]`).
+          examples: [mojsklep]
+        ptu_letter_in_names:
+          type: boolean
+          description: Dodaj literę stawki VAT do nazw pozycji na wydruku.
+        print_requests:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/PrintRequestItemInput" }
+
+    PrintRequestItemInput:
+      type: object
+      required: [external_id, positions]
+      properties:
+        external_id:
+          type: string
+          description: >
+            Identyfikator dokumentu w systemie integratora. Klucz ochrony przed podwójną
+            fiskalizacją: najwyżej jedno aktywne zlecenie per `external_id`
+            (`docs/03-domena.md#unikalnosc`).
+          examples: [21f65a83-51e0-11ee-a237-a1c5a4e9c123]
+        mode:
+          type: string
+          enum: [print, e_receipt]
+          description: >
+            Tryb wydruku. Bez pola → domyślny tryb drukarki (a gdy nieustawiony → `print`).
+            Enum opisuje wartości kanoniczne; serwer akceptuje też zapisy
+            `e-receipt`/`ereceipt`. Wartość nierozpoznana = błąd (nie cichy fallback).
+          examples: [e_receipt]
+        printer_id:
+          type: integer
+          description: Id drukarki z listy drukarek (zalecane).
+          examples: [42]
+        printer_name:
+          type: string
+          description: Alternatywa dla `printer_id` — dopasowanie po nazwie.
+          examples: ["Kasa 1"]
+        vendor:
+          type: string
+          minLength: 1
+          description: >
+            Vendor tego dokumentu — nadpisuje `vendor` wspólny dla żądania. Bez obu dokument
+            zostaje odrzucony. Nie trafia do `source_document`.
+          examples: [mojsklep]
+        kind:
+          type: string
+          enum: [receipt, vat]
+          default: receipt
+          description: >
+            Typ dokumentu: `receipt` (paragon) albo `vat` (faktura). E-paragon wymaga
+            `receipt`. Rabaty (`discount*`) działają dla obu — na fakturze zachowanie
+            zależy od drukarki klienta, patrz `docs/03-domena.md#rabat-na-fakturze`.
+            `vat` wymaga zwykle `buyer.tax_no` (część protokołów drukarek odrzuca fakturę
+            bez NIP).
+          examples: [receipt]
+        system_number:
+          type: string
+          description: Numer dokumentu (drukowany, obcinany do 15 znaków).
+          examples: ["PAR/10045/2026"]
+        order_number:
+          type: string
+          description: Dodatkowy identyfikator zamówienia.
+          examples: ["10045"]
+        external_url:
+          type: string
+          format: uri
+          description: Link do dokumentu w systemie integratora.
+          examples: ["https://sklep.mojafirma.pl/zamowienia/10045"]
+        currency:
+          type: string
+          const: PLN
+          default: PLN
+          examples: [PLN]
+        price_gross:
+          type: [number, string]
+          description: >
+            Suma brutto dokumentu; gdy brak — wyliczana z pozycji. Musi zgadzać się
+            z sumą pozycji (minus rabaty).
+          examples: ["130.00"]
+        payment_to:
+          type: string
+          description: Termin płatności (drukowany, do 16 znaków).
+          examples: ["2026-08-05"]
+        payment_type:
+          type: string
+          description: >
+            Kod formy płatności: `cash`, `card`, `cheque`, `bon`, `credit`, `transfer`,
+            `voucher`, `other` (dopasowanie czułe na wielkość liter) albo dowolny własny
+            kod. Puste przy podanym `payment_type_text` — forma INNA z tą etykietą; puste
+            przy obu polach — część drukarek pomija formę płatności, część zapisuje
+            gotówkę.
+          examples: [card]
+        payment_type_text:
+          type: string
+          description: >
+            Etykieta formy płatności (drukowana, obcinana do 20 znaków). Przy własnym
+            kodzie w `payment_type` oraz bez `payment_type` drukowana bez zmian; przy
+            kodzie rozpoznanym część drukarek zastępuje ją nazwą kanoniczną. Puste —
+            etykietę wyznacza `payment_type`.
+          examples: ["Karta płatnicza"]
+        recipient_name:
+          type: string
+          description: Odbiorca (do 26 znaków) — drukowany tylko dla `kind=vat`.
+          examples: ["Jan Kowalski"]
+        buyer:
+          $ref: "#/components/schemas/BuyerInput"
+        positions:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/PositionInput" }
+
+    BuyerInput:
+      type: object
+      properties:
+        name:
+          type: string
+          description: "Drukowane tylko dla `kind=vat`."
+          examples: ["Jan Kowalski"]
+        email:
+          type: string
+          format: email
+          description: >
+            Adres doręczenia e-paragonu mailem. Opcjonalny — jego brak nie blokuje
+            fiskalizacji, a jego podanie włącza automatyczną wysyłkę, o ile konto
+            jej nie wyłączyło w ustawieniach (`docs/03-domena.md#e-paragon`).
+            Nie jest drukowany.
+          examples: ["jan@example.com"]
+        address:
+          type: string
+          description: "Drukowane tylko dla `kind=vat`."
+          examples: ["ul. Polna 5, 00-001 Warszawa"]
+        tax_no:
+          type: string
+          description: NIP nabywcy — drukowany na paragonie (paragon z NIP); dla `kind=vat` część drukarek go wymaga.
+          examples: ["1234563218"]
+
+    PositionInput:
+      type: object
+      required: [name, quantity, price_gross, total_price_gross, tax]
+      properties:
+        name:
+          type: string
+          description: Nazwa pozycji (drukowana).
+          examples: ["Zestaw upominkowy XL"]
+        short_name:
+          type: string
+          description: Krótsza nazwa — jeśli podana, drukowana zamiast `name`.
+          examples: ["Zestaw XL"]
+        quantity:
+          type: [number, string]
+          description: >
+            Ilość — większa od zera, ułamkowa dopuszczalna, maksymalnie 5 miejsc po
+            przecinku.
+          examples: ["1"]
+        price_gross:
+          type: [number, string]
+          description: Cena jednostkowa brutto.
+          examples: ["100.00"]
+        total_price_gross:
+          type: [number, string]
+          description: >
+            Wartość brutto pozycji — dodatnia i równa `price_gross × quantity`
+            (zaokrąglenie do 2 miejsc).
+          examples: ["100.00"]
+        tax:
+          type: [number, string]
+          description: >
+            Stawka VAT: 23, 8, 5, 0, `zw`, `disabled` (mapowanie na litery PTU —
+            `docs/03-domena.md#stawki-vat`; `disabled` wymaga skonfigurowanego Zera
+            technicznego).
+          examples: ["23"]
+        discount:
+          type: [number, string]
+          description: >
+            Kwota rabatu brutto na pozycji. Podana ma pierwszeństwo przed
+            `discount_percent` — gdy oba pola podane, `discount_percent` staje się
+            wyłącznie opisem drukowanym. Na fakturze (`kind=vat`) zachowanie zależy od
+            drukarki klienta, patrz `docs/03-domena.md#rabat-na-fakturze`. Przykład:
+            `docs/04-endpointy.md#przyklad-pelny`.
+          examples: ["10.00"]
+        discount_percent:
+          type: [number, string]
+          description: >
+            Procent rabatu (0–100 wyłącznie), drukowany na paragonie. Bez `discount`
+            kwotę wylicza API: `kwota = total_price_gross − zaokrąglone(price_gross ×
+            (1 − procent/100) × quantity, 2)` (połówki w górę).
+          examples: ["20"]
+        service:
+          type: boolean
+          description: Pozycja jest usługą (ma znaczenie dla stawki `disabled`).
+
+    PrintRequestCreateResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+          description: "`success` = przynajmniej jeden dokument przyjęty."
+        message:
+          type: string
+          description: >
+            Przy błędzie całego żądania (bez pozycji, np. brak tablicy `print_requests`)
+            niesie przyczynę (np. "Brak paragonów do wydruku").
+        print_requests:
+          type: array
+          description: >
+            Kontrakt pozycyjny — element [i] odpowiada `print_requests[i]` żądania.
+            Dokument przyjęty = pełny obiekt zlecenia (ma `id`; kształt jak
+            `GET /print_requests/{id}.json`), odrzucony = `{external_id, errors}` bez `id`.
+            Odrzucone mogą wystąpić także przy `status=success` (częściowe przyjęcie).
+            Katalog komunikatów: `docs/06-bledy.md`.
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/PrintRequest"
+              - $ref: "#/components/schemas/RejectedDocument"
+
+    RejectedDocument:
+      type: object
+      description: Dokument odrzucony przy tworzeniu zleceń — element bez `id`.
+      properties:
+        external_id:
+          type: [string, "null"]
+          description: >
+            Identyfikator odrzuconego dokumentu; `null`, gdy dokumentu nie dało się
+            zidentyfikować (brak `external_id`).
+        errors:
+          type: array
+          items: { type: string }
+          description: Komunikaty błędów dokumentu (bez prefiksu kontekstu).
+
+    PrintRequest:
+      type: object
+      description: Zlecenie fiskalizacji (odpowiedź odczytu).
+      properties:
+        id: { type: integer }
+        external_id: { type: string }
+        status: { $ref: "#/components/schemas/PrintRequestStatus" }
+        vendor: { type: string }
+        e_receipt:
+          type: boolean
+          description: >-
+            Czy zlecenie fiskalizuje e-paragon; odzwierciedla rozstrzygnięty tryb zlecenia
+            (mode ze zlecenia, w braku default_mode drukarki, w braku print).
+        printer_id: { type: integer }
+        external_url: { type: [string, "null"] }
+        view_url:
+          type: string
+          format: uri
+          description: >
+            Publiczny link do e-paragonu — obecny wyłącznie gdy `status=er_printed`
+            (jak w webhooku, razem ze statusem).
+          examples: ["https://moja-firma.paragony.pl/iB000002Ef4c..."]
+        source_document:
+          type: object
+          description: Zapamiętana treść dokumentu ze zlecenia.
+          additionalProperties: true
+        email_delivery:
+          $ref: "#/components/schemas/EmailDelivery"
+      additionalProperties: true
+
+    PrinterInput:
+      type: object
+      description: >-
+        Pola edytowalne przez integratora (PATCH). Tożsamość i możliwości urządzenia
+        (uid, model, connection_method, e_receipt, e_receipt_configured) są tylko do odczytu
+        — ustawia je aplikacja Paragony.pl, a nadesłane wartości są ignorowane.
+      properties:
+        name: { type: string, examples: ["Drukarka testowa"] }
+        default_mode:
+          type: string
+          enum: [print, e_receipt]
+          description: >
+            Domyślny tryb wydruku — ustawienie użytkownika; nie nadpisuj bez potrzeby.
+          examples: [e_receipt]
+        footer_text: { type: string, examples: ["Dziękujemy za zakupy!"] }
+        logo_data:
+          type: object
+          description: >-
+            Logo drukowane na e-paragonie: plik w base64 albo `{"delete": true}`, żeby
+            usunąć obecne. Pole tylko do zapisu — odczyt drukarki go nie zwraca.
+          properties:
+            base64_data: { type: string }
+            file_name: { type: string, examples: ["logo.png"] }
+            content_type: { type: string, examples: ["image/png"] }
+            delete:
+              type: boolean
+              description: "`true` — usuń obecne logo (pozostałe pola pomijasz)."
+
+    Printer:
+      type: object
+      properties:
+        id: { type: integer }
+        uid: { type: string }
+        name: { type: [string, "null"] }
+        model: { type: [string, "null"] }
+        connection_method: { type: [string, "null"] }
+        default_mode:
+          type: [string, "null"]
+          enum: [print, e_receipt, null]
+        e_receipt: { type: boolean }
+        e_receipt_configured: { type: boolean }
+        footer_text: { type: [string, "null"] }
+      additionalProperties: true
+
+    ConnectorInput:
+      type: object
+      required: [kind, code, url, secret_token]
+      properties:
+        kind:
+          type: string
+          const: paragony/callback
+        code:
+          type: string
+          description: >
+            `paragony-<vendor>` — sufiks równy wartości `vendor` z Twoich zleceń
+            (osobny connector per vendor).
+          examples: ["paragony-mojsklep"]
+        url:
+          type: string
+          format: uri
+          description: Adres odbiornika webhooków (przechowywany w całości, z portem/query).
+          examples: ["https://api.mojafirma.pl/webhooki/paragony"]
+        secret_token:
+          type: string
+          description: >
+            Sekret podpisu webhooków — **tylko do zapisu** (odpowiedzi zwracają najwyżej
+            maskowany podgląd `secret_token_info`, nigdy pełną wartość); zapisz go
+            u siebie, zgubiony można tylko zmienić (`PATCH`).
+          examples: ["WYGENEROWANY_SEKRET"]
+        active:
+          type: boolean
+          default: true
+          description: Czy connector aktywny.
+
+    Connector:
+      type: object
+      description: >
+        Connector w odpowiedziach — nigdy nie zawiera pełnego `secret_token`
+        (tylko maskowany podgląd `secret_token_info`).
+      properties:
+        id: { type: integer, examples: [17] }
+        code: { type: string, examples: ["paragony-mojsklep"] }
+        kind: { type: string, examples: ["paragony/callback"] }
+        url: { type: string, examples: ["https://api.mojafirma.pl/webhooki/paragony"] }
+        active: { type: boolean }
+        secret_token_info:
+          type: [string, "null"]
+          description: Maskowany podgląd sekretu (pierwszy i dwa ostatnie znaki).
+      additionalProperties: true
+
+    ApiToken:
+      type: object
+      properties:
+        id: { type: integer, examples: [12] }
+        name: { type: [string, "null"], examples: [moj-system] }
+        kind: { type: [string, "null"] }
+        for_account: { type: boolean }
+        integration_app_code: { type: [string, "null"] }
+        active: { type: boolean }
+        expires_at: { type: [string, "null"], format: date-time }
+      additionalProperties: true
+
+    SimpleMessage:
+      type: object
+      properties:
+        message: { type: string }
+
+    StatusMessage:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        message:
+          type: string
+
+    EmailDelivery:
+      type: object
+      description: >
+        Stan wysyłki e-paragonu mailem — pole `PrintRequest.email_delivery` istnieje
+        wyłącznie gdy `status=er_printed` (`docs/03-domena.md#statusy-zlecenia`).
+        Wysyłkę zleca `POST /print_requests/{id}/send_by_email.json`
+        (`docs/04-endpointy.md#wysylka-mailem`).
+      properties:
+        email:
+          type: [string, "null"]
+          format: email
+          description: >
+            Aktualny adres doręczenia — `buyer.email` ze zlecenia albo korekta
+            z ostatniego `send_by_email`; `null`, gdy zlecenie powstało bez adresu.
+          examples: ["jan@example.com"]
+        email_status:
+          type: [string, "null"]
+          enum: [null, queued, sent, failed]
+          description: Stan ostatniej zleconej wysyłki maila; `null` — jeszcze nie zlecano.
+        email_error:
+          type: [string, "null"]
+          description: Powód nieudanej wysyłki; `null`, gdy ostatnia wysyłka się nie zepsuła.
+        email_sent_at:
+          type: [string, "null"]
+          format: date-time
+          description: >
+            Czas ostatniej udanej wysyłki (ISO8601); `null`, dopóki żadna się nie
+            powiodła.

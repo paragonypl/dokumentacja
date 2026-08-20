@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<link rel="canonical" href="__CANONICAL__">
+<title>Dokumentacja API Paragony.pl — nowy adres</title>
+<script>
+  // Ten plik jest publikowany też jako 404.html, a GitHub Pages podaje 404 pod KAŻDĄ
+  // nieistniejącą ścieżką portalu — dzięki temu jeden plik przenosi zarówno wejście
+  // na korzeń, jak i deep-linki: /<repo>/04-endpointy/ → __CANONICAL__04-endpointy/
+  (function () {
+    var base = "__BASE__";
+    var path = location.pathname;
+    var rest = path.indexOf(base) === 0 ? path.slice(base.length) : "";
+    location.replace("__CANONICAL__" + rest + location.search + location.hash);
+  })();
+</script>
+<!-- Fallback bez JS. Trafia w korzeń portalu, bo sama ścieżka podstrony wymaga skryptu. -->
+<meta http-equiv="refresh" content="0; url=__CANONICAL__">
+</head>
+<body>
+<p>Dokumentacja API Paragony.pl jest teraz pod adresem
+<a href="__CANONICAL__">__CANONICAL__</a>.</p>
+</body>
+</html>

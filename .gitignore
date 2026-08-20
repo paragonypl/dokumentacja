@@ -1,0 +1,6 @@
+ms.md
+
+# MkDocs
+site/
+docs/openapi.yaml
+.venv*/

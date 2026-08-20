@@ -1,0 +1,51 @@
+name: Deploy docs
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      # Portal kanoniczny nie ma tej zmiennej i publikuje zbudowaną dokumentację. Każdy inny
+      # deploy trzyma w niej adres portalu kanonicznego (Settings → Secrets and variables →
+      # Actions → Variables) i publikuje WYŁĄCZNIE przekierowanie — dwa adresy tej samej treści
+      # dzielą ruch i konkurują w wyszukiwarkach. Adres w zmiennej, nie nazwa organizacji
+      # w kodzie: przeniesienie repo między organizacjami nie zmienia roli deployu.
+      DOCS_CANONICAL_URL: ${{ vars.DOCS_CANONICAL_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-docs.txt
+      # Spec jest canonically w root repo; wtyczka swagger-ui-tag wymaga jej pod docs_dir.
+      - run: cp openapi.yaml docs/openapi.yaml
+      # Build leci ZAWSZE, także w deployu przekierowującym: to jedyna walidacja dokumentacji
+      # w tym repo (martwe linki, kotwice, składnia). Deploy przekierowujący po prostu
+      # nie publikuje wyniku.
+      - run: mkdocs build --strict
+      - name: Deploy niekanoniczny publikuje przekierowanie zamiast kopii treści
+        if: env.DOCS_CANONICAL_URL != ''
+        run: |
+          target="${DOCS_CANONICAL_URL%/}/"
+          base="/${GITHUB_REPOSITORY#*/}/"
+          rm -rf site
+          mkdir site
+          sed -e "s|__CANONICAL__|$target|g" -e "s|__BASE__|$base|g" mirror/redirect.html > site/index.html
+          cp site/index.html site/404.html
+          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

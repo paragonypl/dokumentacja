@@ -1,0 +1,47 @@
+site_name: API Paragony.pl — dokumentacja
+site_description: Dokumentacja API paragonów (hub Paragony.pl) dla zewnętrznych integratorów
+docs_dir: docs
+theme:
+  name: material
+  language: pl
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+plugins:
+  - search
+  - swagger-ui-tag:
+      tryItOutEnabled: true
+extra_javascript:
+  - javascripts/api-token-auth.js
+  - javascripts/swagger-response-visibility.js
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+      # Slug zgodny z GitHubem (zachowuje polskie znaki) — pliki docs/ są autorowane
+      # pod przeglądanie na GitHubie, więc kotwice #naglówki muszą się zgadzać.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+# openapi.yaml jest kopiowany pod docs/ przy buildzie (patrz workflow), więc linki w docs/
+# celują w `openapi.yaml` (nie `../openapi.yaml`) i rozwiązują się wewnątrz docs_dir.
+# not_found: warn + build --strict = CI łapie martwe linki (np. do niepublikowanych plików roota).
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+nav:
+  - Wprowadzenie: 01-wprowadzenie.md
+  - Konto i uwierzytelnianie: 02-konto-i-uwierzytelnianie.md
+  - Model domeny: 03-domena.md
+  - Endpointy: 04-endpointy.md
+  - Webhooki: 05-webhooki.md
+  - Błędy: 06-bledy.md
+  - Klienci referencyjni: 07-klienci-referencyjni.md
+  - Referencja API (OpenAPI): api.md
+  - Integracja przez Fakturownię: 08-fakturownia.md
